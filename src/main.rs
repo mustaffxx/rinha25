@@ -1,6 +1,7 @@
-use actix_web::{get, App, web, HttpResponse, HttpServer, Responder};
+use actix_web::{App, HttpResponse, HttpServer, Responder, get, web};
 use serde::{Deserialize, Serialize};
 
+mod health_worker;
 
 #[derive(Serialize, Deserialize)]
 struct PaymentRequest {
@@ -16,11 +17,11 @@ async fn get_payments(payment: web::Json<PaymentRequest>) -> impl Responder {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    HttpServer::new(|| {
-        App::new()
-            .service(get_payments)
-    })
-    .bind(("127.0.0.1", 9999))?
-    .run()
-    .await
+    let health_worker = health_worker::HealthWorker::new().expect("Failed to create HealthWorker");
+    health_worker.start();
+
+    HttpServer::new(|| App::new().service(get_payments))
+        .bind(("127.0.0.1", 9999))?
+        .run()
+        .await
 }
