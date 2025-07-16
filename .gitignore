@@ -24,3 +24,24 @@ target
 # Added by cargo
 
 /target
+
+# Environment files
+.env
+.env.local
+.env.production
+.env.staging
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Log files
+*.log
+logs/
+
+# Docker
+.dockerignore
+Dockerfile.tmp
