@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::time;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum PaymentSelector {
+pub enum PaymentProcessor {
     Default,
     Fallback,
     None,
@@ -50,11 +50,11 @@ impl HealthWorker {
             let (default_result, fallback_result) = tokio::join!(
                 self.update_service_health(
                     "default",
-                    "http://payment-processor-default:8080/health"
+                    "http://payment-processor-default:8080/payments/service-health"
                 ),
                 self.update_service_health(
                     "fallback",
-                    "http://payment-processor-fallback:8080/health"
+                    "http://payment-processor-fallback:8080/payments/service-health"
                 )
             );
 
@@ -81,33 +81,24 @@ impl HealthWorker {
                 client.set(cache_key, data.as_slice(), 5)?;
                 Ok(())
             }
-            Err(e) => {
-                let failing_health = HealthServiceResponse {
-                    failing: true,
-                    min_response_time: u64::MAX,
-                };
-                let data = serde_json::to_vec(&failing_health)?;
-                let client = self.client.lock().map_err(|_| "Mutex poisoned")?;
-                client.set(cache_key, data.as_slice(), 5)?;
-                Err(e)
-            }
+            Err(e) => Err(e),
         }
     }
 
-    pub fn get_payment_processor(&self) -> PaymentSelector {
+    pub fn get_payment_processor(&self) -> PaymentProcessor {
         if let Ok(health) = self.get_cached_health("default") {
             if !health.failing {
-                return PaymentSelector::Default;
+                return PaymentProcessor::Default;
             }
         }
 
         if let Ok(health) = self.get_cached_health("fallback") {
             if !health.failing {
-                return PaymentSelector::Fallback;
+                return PaymentProcessor::Fallback;
             }
         }
 
-        PaymentSelector::None
+        PaymentProcessor::None
     }
 
     fn get_cached_health(
