@@ -122,6 +122,8 @@ async fn process_payment_async(
             }
             break;
         }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
