@@ -1,4 +1,3 @@
-use memcache;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
