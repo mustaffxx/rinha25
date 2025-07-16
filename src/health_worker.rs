@@ -37,9 +37,10 @@ impl HealthWorker {
         })
     }
 
-    pub fn start(self) -> tokio::task::JoinHandle<()> {
+    pub fn start(&self) -> tokio::task::JoinHandle<()> {
+        let self_clone = self.clone();
         tokio::spawn(async move {
-            self.run().await;
+            self_clone.run().await;
         })
     }
 
