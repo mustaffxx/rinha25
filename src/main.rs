@@ -1,6 +1,9 @@
 use actix_web::{App, HttpResponse, HttpServer, Result, web};
+use chrono::{DateTime, Utc};
+use libsql::{Builder, Database};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
+use tokio::time::Instant;
 
 #[derive(Serialize, Deserialize)]
 struct PaymentMetrics {
@@ -14,6 +17,12 @@ struct PaymentMetrics {
 struct PaymentSummary {
     default: PaymentMetrics,
     fallback: PaymentMetrics,
+}
+
+#[derive(Deserialize)]
+struct SummaryQuery {
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -34,6 +43,7 @@ struct HealthResponse {
 struct AppState {
     http_client: reqwest::Client,
     cache_client: memcache::Client,
+    db: Arc<Database>,
 }
 
 #[actix_web::post("/payments")]
@@ -47,18 +57,43 @@ async fn create_payment(
     tokio::spawn(process_payment_async(
         state.http_client.clone(),
         state.cache_client.clone(),
+        state.db.clone(),
         payment_data,
     ));
 
     Ok(HttpResponse::Ok().json(serde_json::json!({"status": "accepted"})))
 }
 
+#[actix_web::get("/payments/summary")]
+async fn get_payment_summary(
+    query: web::Query<SummaryQuery>,
+    data: web::Data<AppState>,
+) -> Result<HttpResponse> {
+    let summary = fetch_payment_summary(&data.db, query.from, query.to)
+        .await
+        .map_err(|e| {
+            eprintln!("Database error: {}", e);
+            actix_web::error::ErrorInternalServerError("Database error")
+        })?;
+
+    Ok(HttpResponse::Ok().json(summary))
+}
+
 async fn process_payment_async(
     client: reqwest::Client,
     mut cache: memcache::Client,
+    db: Arc<Database>,
     payment: PaymentRequest,
 ) {
+    let start_time = Instant::now();
+    let mut successful_processor = None;
+
     loop {
+        if start_time.elapsed() >= Duration::from_secs(10) {
+            eprintln!("Timeout reached, exiting payment processing loop.");
+            break;
+        }
+
         if is_processor_healthy(&mut cache, "default").unwrap_or(false)
             && send_payment(
                 &client,
@@ -68,10 +103,8 @@ async fn process_payment_async(
             .await
             .is_ok()
         {
-            return;
-        }
-
-        if is_processor_healthy(&mut cache, "fallback").unwrap_or(false)
+            successful_processor = Some("default");
+        } else if is_processor_healthy(&mut cache, "fallback").unwrap_or(false)
             && send_payment(
                 &client,
                 "http://payment-processor-fallback:8080/payments",
@@ -80,9 +113,92 @@ async fn process_payment_async(
             .await
             .is_ok()
         {
-            return;
+            successful_processor = Some("fallback");
+        }
+
+        if let Some(processor) = successful_processor {
+            if let Err(e) = record_payment(&db, processor, &payment).await {
+                eprintln!("Failed to record payment: {}", e);
+            }
+            break;
         }
     }
+}
+
+async fn record_payment(
+    db: &Database,
+    processor: &str,
+    payment: &PaymentRequest,
+) -> Result<(), libsql::Error> {
+    let conn = db.connect()?;
+    match conn
+        .execute(
+            "INSERT INTO payment_events (processor, amount, correlation_id) VALUES (?, ?, ?)",
+            [
+                processor,
+                &payment.amount.to_string(),
+                &payment.correlation_id,
+            ],
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            eprintln!("Failed to insert payment event: {}", e);
+            Err(e)
+        }
+    }
+}
+
+async fn fetch_payment_summary(
+    db: &Database,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Result<PaymentSummary, libsql::Error> {
+    let conn = db.connect()?;
+
+    let mut stmt = conn.prepare(
+        "SELECT processor, COUNT(*) as total_requests, COALESCE(SUM(amount), 0) as total_amount 
+            FROM payment_events 
+            WHERE timestamp >= ? AND timestamp <= ?
+            GROUP BY processor"
+                ).await?;
+
+    let from_str = from.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+    let to_str = to.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+
+    let mut rows = stmt.query([from_str, to_str]).await?;
+
+    let mut summary = PaymentSummary {
+        default: PaymentMetrics {
+            total_requests: 0,
+            total_amount: 0.0,
+        },
+        fallback: PaymentMetrics {
+            total_requests: 0,
+            total_amount: 0.0,
+        },
+    };
+
+    while let Some(row) = rows.next().await? {
+        let processor: String = row.get(0)?;
+        let requests: i64 = row.get(1)?;
+        let amount: f64 = row.get(2)?;
+
+        match processor.as_str() {
+            "default" => {
+                summary.default.total_requests = requests as u64;
+                summary.default.total_amount = amount;
+            }
+            "fallback" => {
+                summary.fallback.total_requests = requests as u64;
+                summary.fallback.total_amount = amount;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(summary)
 }
 
 fn is_processor_healthy(
@@ -108,7 +224,7 @@ async fn send_payment(
     let response = client
         .post(url)
         .json(payment)
-        .timeout(Duration::from_millis(100))
+        .timeout(Duration::from_millis(200))
         .send()
         .await?;
 
@@ -139,12 +255,16 @@ async fn health_checker(cache: memcache::Client, client: reqwest::Client) {
 
         if let Ok(health) = default_result {
             let vec_health = serde_json::to_vec(&health).unwrap();
-            let _ = cache.set("health_default", &vec_health[..], 10);
+            if let Err(e) = cache.set("health_default", &vec_health[..], 10) {
+                eprintln!("Failed to set cache for health_default: {}", e);
+            }
         }
 
         if let Ok(health) = fallback_result {
             let vec_health = serde_json::to_vec(&health).unwrap();
-            let _ = cache.set("health_fallback", &vec_health[..], 10);
+            if let Err(e) = cache.set("health_fallback", &vec_health[..], 10) {
+                eprintln!("Failed to set cache for health_fallback: {}", e);
+            }
         }
     }
 }
@@ -155,7 +275,7 @@ async fn check_processor_health(
 ) -> Result<HealthResponse, Box<dyn std::error::Error + Send + Sync>> {
     let response = client
         .get(url)
-        .timeout(Duration::from_millis(100))
+        .timeout(Duration::from_millis(200))
         .send()
         .await?;
 
@@ -164,17 +284,27 @@ async fn check_processor_health(
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let auth_token = std::env::var("AUTH_TOKEN").expect("AUTH_TOKEN must be set");
+
+    let db = Builder::new_remote(database_url, auth_token)
+        .build()
+        .await
+        .expect("Failed to connect to database");
+
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .expect("Failed to create HTTP client");
 
+    let cache_url = std::env::var("CACHE_URL").expect("CACHE_URL must be set");
     let cache_client =
-        memcache::Client::connect("127.0.0.1:11211").expect("Failed to connect to memcached");
+        memcache::Client::connect(cache_url).expect("Failed to connect to memcached");
 
     let app_state = AppState {
         http_client: http_client.clone(),
         cache_client: cache_client.clone(),
+        db: Arc::new(db),
     };
 
     tokio::spawn(health_checker(cache_client, http_client));
@@ -183,8 +313,9 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(web::Data::new(app_state.clone()))
             .service(create_payment)
+            .service(get_payment_summary)
     })
-    .bind(("127.0.0.1", 9999))?
+    .bind(("localhost", 9999))?
     .run()
     .await
 }
