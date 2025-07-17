@@ -1,0 +1,101 @@
+services:
+  db-init:
+    image: alpine:3.19
+    container_name: rinha-db-init
+    volumes:
+      - sqlite_data:/data
+      - ./db_schema.sql:/db_schema.sql:ro
+    command: >
+      sh -c "
+        apk add --no-cache sqlite &&
+        if [ ! -f /data/local.db ]; then
+          echo 'Initializing database...' &&
+          sqlite3 /data/local.db < /db_schema.sql &&
+          echo 'Database initialized successfully'
+        else
+          echo 'Database already exists, skipping initialization'
+        fi
+      "
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: "50MB"
+
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: rinha-nginx
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      api1:
+        condition: service_started
+      api2:
+        condition: service_started
+    ports:
+      - "9999:9999"
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: "15MB"
+
+  api1: &api
+    build: .
+    container_name: rinha-api1
+    hostname: api1
+    environment:
+      - DATABASE_PATH=/data/local.db
+      - CACHE_URL=memcache://memcached:11211
+    volumes:
+      - sqlite_data:/data
+    networks:
+      - backend
+      - payment-processor
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      memcached:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.6"
+          memory: "115MB"
+
+  api2:
+    <<: *api
+    container_name: rinha-api2
+    hostname: api2
+
+  memcached:
+    image: memcached:1.6-alpine
+    container_name: rinha-memcached
+    hostname: memcached
+    command: ["memcached", "-m", "64", "-c", "1024", "-v"]
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "11211"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: "35MB"
+
+volumes:
+  sqlite_data:
+    driver: local
+
+networks:
+  backend:
+    driver: bridge
+  payment-processor:
+    external: true
