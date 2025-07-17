@@ -328,7 +328,7 @@ async fn main() -> std::io::Result<()> {
             .service(create_payment)
             .service(get_payment_summary)
     })
-    .bind(("0.0.0.0", 9999))?
+    .bind(("0.0.0.0", 8080))?
     .run()
     .await
 }
