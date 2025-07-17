@@ -21,8 +21,8 @@ struct PaymentSummary {
 
 #[derive(Deserialize)]
 struct SummaryQuery {
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -72,8 +72,8 @@ async fn get_payment_summary(
     let summary = fetch_payment_summary(&data.db, query.from, query.to)
         .await
         .map_err(|e| {
-            eprintln!("Database error: {}", e);
-            actix_web::error::ErrorInternalServerError("Database error")
+            eprintln!("Database error in payments-summary: {}", e);
+            actix_web::error::ErrorInternalServerError(format!("Database error: {}", e))
         })?;
 
     Ok(HttpResponse::Ok().json(summary))
@@ -154,22 +154,33 @@ async fn record_payment(
 
 async fn fetch_payment_summary(
     db: &Database,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
 ) -> Result<PaymentSummary, libsql::Error> {
     let conn = db.connect()?;
 
-    let mut stmt = conn.prepare(
-        "SELECT processor, COUNT(*) as total_requests, COALESCE(SUM(amount), 0) as total_amount 
-            FROM payment_events 
-            WHERE timestamp >= ? AND timestamp <= ?
-            GROUP BY processor"
-                ).await?;
+    let query = "
+        SELECT 
+            processor, 
+            COUNT(*) AS total_requests, 
+            COALESCE(SUM(amount), 0) AS total_amount 
+        FROM payment_events 
+        WHERE (? IS NULL OR timestamp >= ?)
+          AND (? IS NULL OR timestamp <= ?)
+        GROUP BY processor";
 
-    let from_str = from.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
-    let to_str = to.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+    let from_str = from.map(|dt| dt.to_rfc3339());
+    let to_str = to.map(|dt| dt.to_rfc3339());
 
-    let mut rows = stmt.query([from_str, to_str]).await?;
+    let mut stmt: libsql::Statement = conn.prepare(query).await?;
+    let mut rows = stmt
+        .query([
+            from_str.as_deref(),
+            from_str.as_deref(),
+            to_str.as_deref(),
+            to_str.as_deref(),
+        ])
+        .await?;
 
     let mut summary = PaymentSummary {
         default: PaymentMetrics {
@@ -184,16 +195,16 @@ async fn fetch_payment_summary(
 
     while let Some(row) = rows.next().await? {
         let processor: String = row.get(0)?;
-        let requests: i64 = row.get(1)?;
-        let amount: f64 = row.get(2)?;
+        let requests = row.get::<i64>(1)? as u64;
+        let amount = row.get::<f64>(2)?;
 
         match processor.as_str() {
             "default" => {
-                summary.default.total_requests = requests as u64;
+                summary.default.total_requests = requests;
                 summary.default.total_amount = amount;
             }
             "fallback" => {
-                summary.fallback.total_requests = requests as u64;
+                summary.fallback.total_requests = requests;
                 summary.fallback.total_amount = amount;
             }
             _ => {}
@@ -286,10 +297,10 @@ async fn check_processor_health(
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let auth_token = std::env::var("AUTH_TOKEN").expect("AUTH_TOKEN must be set");
+    let database_path =
+        std::env::var("DATABASE_PATH").unwrap_or_else(|_| "/data/local.db".to_string());
 
-    let db = Builder::new_remote(database_url, auth_token)
+    let db = Builder::new_local(database_path)
         .build()
         .await
         .expect("Failed to connect to database");
@@ -317,7 +328,7 @@ async fn main() -> std::io::Result<()> {
             .service(create_payment)
             .service(get_payment_summary)
     })
-    .bind(("localhost", 9999))?
+    .bind(("0.0.0.0", 9999))?
     .run()
     .await
 }
