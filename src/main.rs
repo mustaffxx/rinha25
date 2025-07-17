@@ -64,7 +64,7 @@ async fn create_payment(
     Ok(HttpResponse::Ok().json(serde_json::json!({"status": "accepted"})))
 }
 
-#[actix_web::get("/payments/summary")]
+#[actix_web::get("/payments-summary")]
 async fn get_payment_summary(
     query: web::Query<SummaryQuery>,
     data: web::Data<AppState>,
