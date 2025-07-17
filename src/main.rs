@@ -272,6 +272,58 @@ async fn check_processor_health(
     Ok(response.json().await?)
 }
 
+async fn try_process_payment(
+    http_client: &reqwest::Client,
+    cache_client: &memcache::Client,
+    payment_data: &PaymentRequest,
+) -> Option<&'static str> {
+    let mut default_cache = cache_client.clone();
+    let mut fallback_cache = cache_client.clone();
+
+    let default_healthy = is_processor_healthy(&mut default_cache, "default").unwrap_or(false);
+    let fallback_healthy = is_processor_healthy(&mut fallback_cache, "fallback").unwrap_or(false);
+
+    match (default_healthy, fallback_healthy) {
+        (true, _) => {
+            match send_payment(
+                http_client,
+                "http://payment-processor-default:8080/payments",
+                payment_data,
+            )
+            .await
+            {
+                Ok(_) => Some("default"),
+                Err(_) if fallback_healthy => {
+                    match send_payment(
+                        http_client,
+                        "http://payment-processor-fallback:8080/payments",
+                        payment_data,
+                    )
+                    .await
+                    {
+                        Ok(_) => Some("fallback"),
+                        Err(_) => None,
+                    }
+                }
+                Err(_) => None,
+            }
+        }
+        (false, true) => {
+            match send_payment(
+                http_client,
+                "http://payment-processor-fallback:8080/payments",
+                payment_data,
+            )
+            .await
+            {
+                Ok(_) => Some("fallback"),
+                Err(_) => None,
+            }
+        }
+        (false, false) => None,
+    }
+}
+
 async fn payment_worker(
     worker_id: usize,
     shared_receiver: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<PaymentRequest>>>,
@@ -305,37 +357,13 @@ async fn payment_worker(
                     worker_id, payment_data.correlation_id
                 );
 
-                let mut successful_processor = None;
                 let mut retry_count = 0u32;
                 let base_delay_ms = 100u64;
                 let max_delay_ms = 5000u64;
 
                 loop {
-                    let mut cache_clone = cache_client.clone();
-                    if is_processor_healthy(&mut cache_clone, "default").unwrap_or(false)
-                        && send_payment(
-                            &http_client,
-                            "http://payment-processor-default:8080/payments",
-                            &payment_data,
-                        )
-                        .await
-                        .is_ok()
-                    {
-                        successful_processor = Some("default");
-                    } else {
-                        let mut cache_clone = cache_client.clone();
-                        if is_processor_healthy(&mut cache_clone, "fallback").unwrap_or(false)
-                            && send_payment(
-                                &http_client,
-                                "http://payment-processor-fallback:8080/payments",
-                                &payment_data,
-                            )
-                            .await
-                            .is_ok()
-                        {
-                            successful_processor = Some("fallback");
-                        }
-                    }
+                    let successful_processor =
+                        try_process_payment(&http_client, &cache_client, &payment_data).await;
 
                     if let Some(processor) = successful_processor {
                         if let Err(e) =
