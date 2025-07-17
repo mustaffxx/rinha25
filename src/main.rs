@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use libsql::{Builder, Database};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
-use tokio::time::Instant;
+use tokio::sync::mpsc;
 
 #[derive(Serialize, Deserialize)]
 struct PaymentMetrics {
@@ -44,6 +44,7 @@ struct AppState {
     http_client: reqwest::Client,
     cache_client: memcache::Client,
     db: Arc<Database>,
+    payment_queue: mpsc::UnboundedSender<PaymentRequest>,
 }
 
 #[actix_web::post("/payments")]
@@ -54,12 +55,12 @@ async fn create_payment(
     let payment_data = payment.into_inner();
     let state = data.get_ref();
 
-    tokio::spawn(process_payment_async(
-        state.http_client.clone(),
-        state.cache_client.clone(),
-        state.db.clone(),
-        payment_data,
-    ));
+    if let Err(e) = state.payment_queue.send(payment_data) {
+        eprintln!("Failed to queue payment: {}", e);
+        return Ok(
+            HttpResponse::InternalServerError().json(serde_json::json!({"status": "queue_error"}))
+        );
+    }
 
     Ok(HttpResponse::Ok().json(serde_json::json!({"status": "accepted"})))
 }
@@ -79,60 +80,36 @@ async fn get_payment_summary(
     Ok(HttpResponse::Ok().json(summary))
 }
 
-async fn process_payment_async(
-    client: reqwest::Client,
-    mut cache: memcache::Client,
-    db: Arc<Database>,
-    payment: PaymentRequest,
-) {
-    let start_time = Instant::now();
-    let mut successful_processor = None;
-
-    loop {
-        if start_time.elapsed() >= Duration::from_secs(10) {
-            eprintln!("Timeout reached, exiting payment processing loop.");
-            break;
-        }
-
-        if is_processor_healthy(&mut cache, "default").unwrap_or(false)
-            && send_payment(
-                &client,
-                "http://payment-processor-default:8080/payments",
-                &payment,
-            )
-            .await
-            .is_ok()
-        {
-            successful_processor = Some("default");
-        } else if is_processor_healthy(&mut cache, "fallback").unwrap_or(false)
-            && send_payment(
-                &client,
-                "http://payment-processor-fallback:8080/payments",
-                &payment,
-            )
-            .await
-            .is_ok()
-        {
-            successful_processor = Some("fallback");
-        }
-
-        if let Some(processor) = successful_processor {
-            if let Err(e) = record_payment(&db, processor, &payment).await {
-                eprintln!("Failed to record payment: {}", e);
-            }
-            break;
-        }
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
 async fn record_payment(
     db: &Database,
     processor: &str,
     payment: &PaymentRequest,
 ) -> Result<(), libsql::Error> {
     let conn = db.connect()?;
+    match conn
+        .execute(
+            "INSERT INTO payment_events (processor, amount, correlation_id) VALUES (?, ?, ?)",
+            [
+                processor,
+                &payment.amount.to_string(),
+                &payment.correlation_id,
+            ],
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            eprintln!("Failed to insert payment event: {}", e);
+            Err(e)
+        }
+    }
+}
+
+async fn record_payment_with_conn(
+    conn: &libsql::Connection,
+    processor: &str,
+    payment: &PaymentRequest,
+) -> Result<(), libsql::Error> {
     match conn
         .execute(
             "INSERT INTO payment_events (processor, amount, correlation_id) VALUES (?, ?, ?)",
@@ -295,6 +272,107 @@ async fn check_processor_health(
     Ok(response.json().await?)
 }
 
+async fn payment_worker(
+    worker_id: usize,
+    shared_receiver: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<PaymentRequest>>>,
+    http_client: reqwest::Client,
+    cache_client: memcache::Client,
+    database: Arc<Database>,
+) {
+    let db_conn = match database.connect() {
+        Ok(conn) => conn,
+        Err(e) => {
+            eprintln!("Worker {} failed to connect to database: {}", worker_id, e);
+            return;
+        }
+    };
+
+    println!(
+        "Worker {} started with its own database connection",
+        worker_id
+    );
+
+    loop {
+        let payment = {
+            let mut rx = shared_receiver.lock().await;
+            rx.recv().await
+        };
+
+        match payment {
+            Some(payment_data) => {
+                println!(
+                    "Worker {} processing payment: {}",
+                    worker_id, payment_data.correlation_id
+                );
+
+                let mut successful_processor = None;
+                let mut retry_count = 0u32;
+                let base_delay_ms = 100u64;
+                let max_delay_ms = 5000u64;
+
+                loop {
+                    let mut cache_clone = cache_client.clone();
+                    if is_processor_healthy(&mut cache_clone, "default").unwrap_or(false)
+                        && send_payment(
+                            &http_client,
+                            "http://payment-processor-default:8080/payments",
+                            &payment_data,
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        successful_processor = Some("default");
+                    } else {
+                        let mut cache_clone = cache_client.clone();
+                        if is_processor_healthy(&mut cache_clone, "fallback").unwrap_or(false)
+                            && send_payment(
+                                &http_client,
+                                "http://payment-processor-fallback:8080/payments",
+                                &payment_data,
+                            )
+                            .await
+                            .is_ok()
+                        {
+                            successful_processor = Some("fallback");
+                        }
+                    }
+
+                    if let Some(processor) = successful_processor {
+                        if let Err(e) =
+                            record_payment_with_conn(&db_conn, processor, &payment_data).await
+                        {
+                            eprintln!("Worker {} failed to record payment: {}", worker_id, e);
+                        }
+                        break;
+                    }
+
+                    retry_count += 1;
+                    let delay_ms = std::cmp::min(
+                        base_delay_ms * 2u64.pow(std::cmp::min(retry_count, 10)),
+                        max_delay_ms,
+                    );
+
+                    let jitter = (delay_ms as f64 * 0.1 * rand::random::<f64>()) as u64;
+                    let final_delay = delay_ms + jitter;
+
+                    if retry_count % 10 == 0 {
+                        eprintln!(
+                            "Worker {} retrying payment {} (attempt {}), waiting {}ms",
+                            worker_id, payment_data.correlation_id, retry_count, final_delay
+                        );
+                    }
+
+                    tokio::time::sleep(Duration::from_millis(final_delay)).await;
+                }
+            }
+            None => {
+                println!("Worker {} shutting down", worker_id);
+                break;
+            }
+        }
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let database_path =
@@ -314,10 +392,25 @@ async fn main() -> std::io::Result<()> {
     let cache_client =
         memcache::Client::connect(cache_url).expect("Failed to connect to memcached");
 
+    let (payment_sender, payment_receiver) = mpsc::unbounded_channel::<PaymentRequest>();
+    let shared_receiver = Arc::new(tokio::sync::Mutex::new(payment_receiver));
+    let shared_db = Arc::new(db);
+
+    for worker_id in 0..10 {
+        tokio::spawn(payment_worker(
+            worker_id,
+            shared_receiver.clone(),
+            http_client.clone(),
+            cache_client.clone(),
+            shared_db.clone(),
+        ));
+    }
+
     let app_state = AppState {
         http_client: http_client.clone(),
         cache_client: cache_client.clone(),
-        db: Arc::new(db),
+        db: shared_db.clone(),
+        payment_queue: payment_sender,
     };
 
     tokio::spawn(health_checker(cache_client, http_client));
