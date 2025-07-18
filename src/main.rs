@@ -191,19 +191,16 @@ async fn fetch_payment_summary(
     Ok(summary)
 }
 
-fn is_processor_healthy(
-    cache: &mut memcache::Client,
-    processor: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
+fn get_processor_healthy(cache: &mut memcache::Client, processor: &str) -> Option<HealthResponse> {
     let key = format!("health_{}", processor);
 
     if let Ok(Some(data)) = cache.get::<Vec<u8>>(&key) {
         if let Ok(health) = serde_json::from_slice::<HealthResponse>(&data) {
-            return Ok(!health.failing);
+            return Some(health);
         }
     }
 
-    Ok(false)
+    None
 }
 
 async fn send_payment(
@@ -211,12 +208,7 @@ async fn send_payment(
     url: &str,
     payment: &PaymentRequest,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let response = client
-        .post(url)
-        .json(payment)
-        .timeout(Duration::from_millis(200))
-        .send()
-        .await?;
+    let response = client.post(url).json(payment).send().await?;
 
     if response.status().is_success() {
         println!("Payment processed successfully: {}", payment.correlation_id);
@@ -263,16 +255,12 @@ async fn check_processor_health(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<HealthResponse, Box<dyn std::error::Error + Send + Sync>> {
-    let response = client
-        .get(url)
-        .timeout(Duration::from_millis(200))
-        .send()
-        .await?;
+    let response = client.get(url).send().await?;
 
     Ok(response.json().await?)
 }
 
-async fn try_process_payment(
+async fn get_process_payment(
     http_client: &reqwest::Client,
     cache_client: &memcache::Client,
     payment_data: &PaymentRequest,
@@ -280,47 +268,35 @@ async fn try_process_payment(
     let mut default_cache = cache_client.clone();
     let mut fallback_cache = cache_client.clone();
 
-    let default_healthy = is_processor_healthy(&mut default_cache, "default").unwrap_or(false);
-    let fallback_healthy = is_processor_healthy(&mut fallback_cache, "fallback").unwrap_or(false);
+    let default_healthy = get_processor_healthy(&mut default_cache, "default");
+    let fallback_healthy = get_processor_healthy(&mut fallback_cache, "fallback");
 
     match (default_healthy, fallback_healthy) {
-        (true, _) => {
-            match send_payment(
-                http_client,
-                "http://payment-processor-default:8080/payments",
-                payment_data,
-            )
-            .await
-            {
-                Ok(_) => Some("default"),
-                Err(_) if fallback_healthy => {
-                    match send_payment(
-                        http_client,
-                        "http://payment-processor-fallback:8080/payments",
-                        payment_data,
-                    )
-                    .await
-                    {
-                        Ok(_) => Some("fallback"),
-                        Err(_) => None,
-                    }
+        (Some(default), Some(fallback)) => match (default.failing, fallback.failing) {
+            (true, true) => {
+                eprintln!("Both payment processors are unhealthy");
+                None
+            }
+            (false, false) => {
+                if default.min_response_time < fallback.min_response_time {
+                    Some("default")
+                } else {
+                    Some("fallback")
                 }
-                Err(_) => None,
             }
-        }
-        (false, true) => {
-            match send_payment(
-                http_client,
-                "http://payment-processor-fallback:8080/payments",
-                payment_data,
-            )
-            .await
-            {
-                Ok(_) => Some("fallback"),
-                Err(_) => None,
+            (true, false) => {
+                eprintln!("Default processor is unhealthy, using fallback");
+                Some("fallback")
             }
+            (false, true) => {
+                eprintln!("Fallback processor is unhealthy, using default");
+                Some("default")
+            }
+        },
+        _ => {
+            eprintln!("Cannot determine processor health status");
+            None
         }
-        (false, false) => None,
     }
 }
 
@@ -357,40 +333,54 @@ async fn payment_worker(
                     worker_id, payment_data.correlation_id
                 );
 
-                let mut retry_count = 0u32;
-                let base_delay_ms = 100u64;
-                let max_delay_ms = 5000u64;
-
                 loop {
                     let successful_processor =
-                        try_process_payment(&http_client, &cache_client, &payment_data).await;
+                        get_process_payment(&http_client, &cache_client, &payment_data).await;
 
                     if let Some(processor) = successful_processor {
-                        if let Err(e) =
-                            record_payment_with_conn(&db_conn, processor, &payment_data).await
+                        let payment_url = match processor {
+                            "default" => "http://payment-processor-default:8080/payments",
+                            "fallback" => "http://payment-processor-fallback:8080/payments",
+                            _ => {
+                                eprintln!("Worker {} unknown processor: {}", worker_id, processor);
+                                continue;
+                            }
+                        };
+
+                        if let Err(e) = send_payment(&http_client, payment_url, &payment_data).await
                         {
-                            eprintln!("Worker {} failed to record payment: {}", worker_id, e);
+                            eprintln!(
+                                "Worker {} failed to send payment {} to {}: {}",
+                                worker_id, payment_data.correlation_id, processor, e
+                            );
+                            let jitter = (worker_id as u64 * 50) % 100;
+                            tokio::time::sleep(Duration::from_millis(100 + jitter)).await;
+                            continue;
+                        }
+
+                        loop {
+                            if let Err(e) =
+                                record_payment_with_conn(&db_conn, processor, &payment_data).await
+                            {
+                                eprintln!(
+                                    "Worker {} failed to record payment: {}. Retrying...",
+                                    worker_id, e
+                                );
+                                let jitter = (worker_id as u64 * 50) % 100;
+                                tokio::time::sleep(Duration::from_millis(100 + jitter)).await;
+                            } else {
+                                println!(
+                                    "Worker {} recorded payment {} through {} processor",
+                                    worker_id, payment_data.correlation_id, processor
+                                );
+                                break;
+                            }
                         }
                         break;
                     }
 
-                    retry_count += 1;
-                    let delay_ms = std::cmp::min(
-                        base_delay_ms * 2u64.pow(std::cmp::min(retry_count, 10)),
-                        max_delay_ms,
-                    );
-
-                    let jitter = (delay_ms as f64 * 0.1 * rand::random::<f64>()) as u64;
-                    let final_delay = delay_ms + jitter;
-
-                    if retry_count % 10 == 0 {
-                        eprintln!(
-                            "Worker {} retrying payment {} (attempt {}), waiting {}ms",
-                            worker_id, payment_data.correlation_id, retry_count, final_delay
-                        );
-                    }
-
-                    tokio::time::sleep(Duration::from_millis(final_delay)).await;
+                    let jitter = (worker_id as u64 * 50) % 100;
+                    tokio::time::sleep(Duration::from_millis(100 + jitter)).await;
                 }
             }
             None => {
@@ -412,7 +402,6 @@ async fn main() -> std::io::Result<()> {
         .expect("Failed to connect to database");
 
     let http_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
         .build()
         .expect("Failed to create HTTP client");
 
