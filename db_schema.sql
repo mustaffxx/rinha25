@@ -1,10 +1,10 @@
 DROP TABLE IF EXISTS payment_events;
 
 CREATE TABLE payment_events (
-    id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
-    timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    processor TEXT NOT NULL CHECK (processor IN ('default', 'fallback')),
-    amount REAL NOT NULL,
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    timestamp TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    processor VARCHAR(20) NOT NULL CHECK (processor IN ('default', 'fallback')),
+    amount NUMERIC(10, 2) NOT NULL,
     correlation_id TEXT NOT NULL
 );
 

@@ -1,9 +1,15 @@
 use actix_web::{App, HttpResponse, HttpServer, Result, web};
+use bb8::Pool;
+use bb8_postgres::PostgresConnectionManager;
 use chrono::{DateTime, Utc};
-use libsql::{Builder, Database};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::mpsc;
+use tokio_postgres::NoTls;
+
+type DbPool = Pool<PostgresConnectionManager<NoTls>>;
 
 #[derive(Serialize, Deserialize)]
 struct PaymentMetrics {
@@ -43,7 +49,7 @@ struct HealthResponse {
 struct AppState {
     http_client: reqwest::Client,
     cache_client: memcache::Client,
-    db: Arc<Database>,
+    db: DbPool,
     payment_queue: mpsc::UnboundedSender<PaymentRequest>,
 }
 
@@ -80,61 +86,34 @@ async fn get_payment_summary(
     Ok(HttpResponse::Ok().json(summary))
 }
 
-async fn record_payment(
-    db: &Database,
-    processor: &str,
-    payment: &PaymentRequest,
-) -> Result<(), libsql::Error> {
-    let conn = db.connect()?;
-    match conn
-        .execute(
-            "INSERT INTO payment_events (processor, amount, correlation_id) VALUES (?, ?, ?)",
-            [
-                processor,
-                &payment.amount.to_string(),
-                &payment.correlation_id,
-            ],
-        )
-        .await
-    {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            eprintln!("Failed to insert payment event: {}", e);
-            Err(e)
-        }
-    }
-}
-
 async fn record_payment_with_conn(
-    conn: &libsql::Connection,
+    conn: &bb8::PooledConnection<'_, PostgresConnectionManager<NoTls>>,
     processor: &str,
     payment: &PaymentRequest,
-) -> Result<(), libsql::Error> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let amount_decimal = Decimal::from_f64(payment.amount).unwrap_or(Decimal::ZERO);
+
     match conn
         .execute(
-            "INSERT INTO payment_events (processor, amount, correlation_id) VALUES (?, ?, ?)",
-            [
-                processor,
-                &payment.amount.to_string(),
-                &payment.correlation_id,
-            ],
+            "INSERT INTO payment_events (processor, amount, correlation_id) VALUES ($1, $2, $3)",
+            &[&processor, &amount_decimal, &payment.correlation_id],
         )
         .await
     {
         Ok(_) => Ok(()),
         Err(e) => {
             eprintln!("Failed to insert payment event: {}", e);
-            Err(e)
+            Err(e.into())
         }
     }
 }
 
 async fn fetch_payment_summary(
-    db: &Database,
+    db: &DbPool,
     from: Option<DateTime<Utc>>,
     to: Option<DateTime<Utc>>,
-) -> Result<PaymentSummary, libsql::Error> {
-    let conn = db.connect()?;
+) -> Result<PaymentSummary, Box<dyn std::error::Error + Send + Sync>> {
+    let conn = db.get().await?;
 
     let query = "
         SELECT 
@@ -142,22 +121,11 @@ async fn fetch_payment_summary(
             COUNT(*) AS total_requests, 
             COALESCE(SUM(amount), 0) AS total_amount 
         FROM payment_events 
-        WHERE (? IS NULL OR timestamp >= ?)
-          AND (? IS NULL OR timestamp <= ?)
+        WHERE ($1::timestamptz IS NULL OR timestamp >= $1)
+          AND ($2::timestamptz IS NULL OR timestamp <= $2)
         GROUP BY processor";
 
-    let from_str = from.map(|dt| dt.to_rfc3339());
-    let to_str = to.map(|dt| dt.to_rfc3339());
-
-    let mut stmt: libsql::Statement = conn.prepare(query).await?;
-    let mut rows = stmt
-        .query([
-            from_str.as_deref(),
-            from_str.as_deref(),
-            to_str.as_deref(),
-            to_str.as_deref(),
-        ])
-        .await?;
+    let rows = conn.query(query, &[&from, &to]).await?;
 
     let mut summary = PaymentSummary {
         default: PaymentMetrics {
@@ -170,19 +138,19 @@ async fn fetch_payment_summary(
         },
     };
 
-    while let Some(row) = rows.next().await? {
-        let processor: String = row.get(0)?;
-        let requests = row.get::<i64>(1)? as u64;
-        let amount = row.get::<f64>(2)?;
+    for row in rows {
+        let processor: String = row.get(0);
+        let requests: i64 = row.get(1);
+        let amount: Decimal = row.get(2);
 
         match processor.as_str() {
             "default" => {
-                summary.default.total_requests = requests;
-                summary.default.total_amount = amount;
+                summary.default.total_requests = requests as u64;
+                summary.default.total_amount = amount.to_string().parse().unwrap_or(0.0);
             }
             "fallback" => {
-                summary.fallback.total_requests = requests;
-                summary.fallback.total_amount = amount;
+                summary.fallback.total_requests = requests as u64;
+                summary.fallback.total_amount = amount.to_string().parse().unwrap_or(0.0);
             }
             _ => {}
         }
@@ -261,9 +229,9 @@ async fn check_processor_health(
 }
 
 async fn get_process_payment(
-    http_client: &reqwest::Client,
+    _http_client: &reqwest::Client,
     cache_client: &memcache::Client,
-    payment_data: &PaymentRequest,
+    _payment_data: &PaymentRequest,
 ) -> Option<&'static str> {
     let mut default_cache = cache_client.clone();
     let mut fallback_cache = cache_client.clone();
@@ -305,20 +273,9 @@ async fn payment_worker(
     shared_receiver: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<PaymentRequest>>>,
     http_client: reqwest::Client,
     cache_client: memcache::Client,
-    database: Arc<Database>,
+    database: DbPool,
 ) {
-    let db_conn = match database.connect() {
-        Ok(conn) => conn,
-        Err(e) => {
-            eprintln!("Worker {} failed to connect to database: {}", worker_id, e);
-            return;
-        }
-    };
-
-    println!(
-        "Worker {} started with its own database connection",
-        worker_id
-    );
+    println!("Worker {} started", worker_id);
 
     loop {
         let payment = {
@@ -359,8 +316,21 @@ async fn payment_worker(
                         }
 
                         loop {
+                            let conn = match database.get().await {
+                                Ok(conn) => conn,
+                                Err(e) => {
+                                    eprintln!(
+                                        "Worker {} failed to get database connection: {}",
+                                        worker_id, e
+                                    );
+                                    let jitter = (worker_id as u64 * 50) % 100;
+                                    tokio::time::sleep(Duration::from_millis(100 + jitter)).await;
+                                    continue;
+                                }
+                            };
+
                             if let Err(e) =
-                                record_payment_with_conn(&db_conn, processor, &payment_data).await
+                                record_payment_with_conn(&conn, processor, &payment_data).await
                             {
                                 eprintln!(
                                     "Worker {} failed to record payment: {}. Retrying...",
@@ -393,13 +363,16 @@ async fn payment_worker(
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let database_path =
-        std::env::var("DATABASE_PATH").unwrap_or_else(|_| "/data/local.db".to_string());
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:password@localhost/rinha25".to_string());
 
-    let db = Builder::new_local(database_path)
-        .build()
+    let manager = PostgresConnectionManager::new_from_stringlike(database_url, NoTls)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    let db = Pool::builder()
+        .build(manager)
         .await
-        .expect("Failed to connect to database");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e))?;
 
     let http_client = reqwest::Client::builder()
         .build()
@@ -411,7 +384,6 @@ async fn main() -> std::io::Result<()> {
 
     let (payment_sender, payment_receiver) = mpsc::unbounded_channel::<PaymentRequest>();
     let shared_receiver = Arc::new(tokio::sync::Mutex::new(payment_receiver));
-    let shared_db = Arc::new(db);
 
     for worker_id in 0..10 {
         tokio::spawn(payment_worker(
@@ -419,14 +391,14 @@ async fn main() -> std::io::Result<()> {
             shared_receiver.clone(),
             http_client.clone(),
             cache_client.clone(),
-            shared_db.clone(),
+            db.clone(),
         ));
     }
 
     let app_state = AppState {
         http_client: http_client.clone(),
         cache_client: cache_client.clone(),
-        db: shared_db.clone(),
+        db: db.clone(),
         payment_queue: payment_sender,
     };
 
