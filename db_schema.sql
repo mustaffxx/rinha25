@@ -1,3 +1,5 @@
+DROP TABLE IF EXISTS payment_events;
+
 CREATE TABLE payment_events (
     id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
     timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
