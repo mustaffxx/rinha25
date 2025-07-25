@@ -8,7 +8,6 @@ services:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=password
     volumes:
-      - postgres_data:/var/lib/postgresql/data
       - ./db_schema.sql:/docker-entrypoint-initdb.d/db_schema.sql:ro
     networks:
       - backend
@@ -51,47 +50,43 @@ services:
     hostname: api1
     environment:
       - DATABASE_URL=postgres://postgres:password@postgres/rinha25
-      - CACHE_URL=memcache://memcached:11211
+      - REDIS_URL=redis://redis:6379
     networks:
       - backend
       - payment-processor
     depends_on:
       postgres:
         condition: service_healthy
-      memcached:
-        condition: service_healthy
+      redis:
+        condition: service_started
     deploy:
       resources:
         limits:
-          cpus: "0.3"
-          memory: "80MB"
+          cpus: "0.4"
+          memory: "90MB"
 
   api2:
     <<: *api
     container_name: rinha-api2
     hostname: api2
 
-  memcached:
-    image: memcached:1.6-alpine
-    container_name: rinha-memcached
-    hostname: memcached
-    command: ["memcached", "-m", "64", "-c", "1024", "-v"]
+  redis:
+    image: redis:7-alpine
+    container_name: rinha-redis
+    hostname: redis
     networks:
       - backend
     healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "11211"]
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 3
     deploy:
       resources:
         limits:
-          cpus: "0.3"
-          memory: "80MB"
+          cpus: "0.4"
+          memory: "100MB"
 
-volumes:
-  postgres_data:
-    driver: local
 
 networks:
   backend:
