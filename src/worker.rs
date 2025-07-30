@@ -33,15 +33,14 @@ pub async fn payment_worker(
             .and_then(|(_, payload)| serde_json::from_slice(&payload).ok());
 
         if payment_data.is_none() {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         }
 
         if let Some(mut payment_data) = payment_data {
             let lock_key = "payments_summary_lock";
             while is_redis_locked(&redis_pool, lock_key).await {
-                let jitter = thread_rng().gen_range(0..50);
-                tokio::time::sleep(std::time::Duration::from_millis(50 + jitter)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
 
             println!(
@@ -50,18 +49,18 @@ pub async fn payment_worker(
             );
 
             loop {
-                let successful_processor =
-                    get_process_payment(&http_client, &health_data, &payment_data).await;
-
-                if let Some(processor) = successful_processor {
-                    let payment_url = match processor {
-                        "default" => "http://payment-processor-default:8080/payments",
-                        "fallback" => "http://payment-processor-fallback:8080/payments",
-                        _ => {
-                            eprintln!("Worker {} unknown processor: {}", worker_id, processor);
-                            continue;
-                        }
-                    };
+                if let Some(processor) =
+                    get_process_payment(&http_client, &health_data, &payment_data).await
+                {
+                    // let payment_url = match processor {
+                    //     "default" => "http://payment-processor-default:8080/payments",
+                    //     "fallback" => "http://payment-processor-fallback:8080/payments",
+                    //     _ => {
+                    //         eprintln!("Worker {} unknown processor: {}", worker_id, processor);
+                    //         continue;
+                    //     }
+                    // };
+                    let payment_url = "http://payment-processor-default:8080/payments";
 
                     payment_data.requested_at = Some(Utc::now());
                     let processor_start = std::time::Instant::now();
@@ -79,17 +78,47 @@ pub async fn payment_worker(
                                 processor_duration
                             );
 
-                            let mut map = health_data.lock().await;
-                            if let Some(health) = map.get_mut(processor) {
-                                if health.failing {
-                                    health.failing = false;
-                                    health.min_response_time = processor_duration_ms;
-                                    println!(
-                                        "Worker {}: processor {} marked healthy after successful payment",
-                                        worker_id, processor
-                                    );
-                                }
+                            let redis_store_start = std::time::Instant::now();
+                            let id = &payment_data.correlation_id;
+                            let amount = payment_data.amount;
+
+                            let timestamp_ms = payment_data
+                                .requested_at
+                                .map(|dt| dt.timestamp_millis() as f64)
+                                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as f64);
+
+                            let pipe_result: deadpool_redis::redis::RedisResult<()> = pipe()
+                                .atomic()
+                                .hset(format!("summary:{}:data", processor), id, amount)
+                                .zadd(format!("summary:{}:history", processor), id, timestamp_ms)
+                                .query_async(&mut redis_conn)
+                                .await;
+
+                            let dur = redis_store_start.elapsed();
+                            match pipe_result {
+                                Ok(_) => println!(
+                                    "Worker {}: stored payment {} (amount: {}) for {} in Redis in {:?}",
+                                    worker_id, id, amount, processor, dur
+                                ),
+                                Err(e) => eprintln!(
+                                    "Worker {}: failed to store payment {} for {} in Redis in {:?}: {}",
+                                    worker_id, id, processor, dur, e
+                                ),
                             }
+
+                            break;
+
+                            // let mut map = health_data.lock().await;
+                            // if let Some(health) = map.get_mut(processor) {
+                            //     if health.failing {
+                            //         health.failing = false;
+                            //         health.min_response_time = processor_duration_ms;
+                            //         println!(
+                            //             "Worker {}: processor {} marked healthy after successful payment",
+                            //             worker_id, processor
+                            //         );
+                            //     }
+                            // }
                         }
                         Err(e) => {
                             println!(
@@ -114,40 +143,6 @@ pub async fn payment_worker(
                             }
                         }
                     }
-
-                    if send_result.is_err() {
-                        continue;
-                    }
-
-                    let redis_store_start = std::time::Instant::now();
-                    let id = &payment_data.correlation_id;
-                    let amount = payment_data.amount;
-
-                    let timestamp_ms = payment_data
-                        .requested_at
-                        .map(|dt| dt.timestamp_millis() as f64)
-                        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as f64);
-
-                    let pipe_result: deadpool_redis::redis::RedisResult<()> = pipe()
-                        .atomic()
-                        .hset(format!("summary:{}:data", processor), id, amount)
-                        .zadd(format!("summary:{}:history", processor), id, timestamp_ms)
-                        .query_async(&mut redis_conn)
-                        .await;
-
-                    let dur = redis_store_start.elapsed();
-                    match pipe_result {
-                        Ok(_) => println!(
-                            "Worker {}: stored payment {} (amount: {}) for {} in Redis in {:?}",
-                            worker_id, id, amount, processor, dur
-                        ),
-                        Err(e) => eprintln!(
-                            "Worker {}: failed to store payment {} for {} in Redis in {:?}: {}",
-                            worker_id, id, processor, dur, e
-                        ),
-                    }
-
-                    break;
                 }
             }
         }

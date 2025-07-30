@@ -86,22 +86,27 @@ impl AppState {
 pub fn create_pg_manager(
     database_url: &str,
 ) -> Result<PostgresConnectionManager<NoTls>, std::io::Error> {
-    PostgresConnectionManager::new_from_stringlike(database_url, NoTls)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    PostgresConnectionManager::new_from_stringlike(database_url, NoTls).map_err(|e| {
+        eprintln!("Failed to create PostgresConnectionManager: {}", e);
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+    })
 }
 
 pub async fn create_db_pool(
     manager: PostgresConnectionManager<NoTls>,
 ) -> Result<DbPool, std::io::Error> {
-    Pool::builder()
-        .build(manager)
-        .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e))
+    Pool::builder().build(manager).await.map_err(|e| {
+        eprintln!("Failed to create Postgres DB pool: {}", e);
+        std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e)
+    })
 }
 
 pub fn create_redis_pool(redis_url: &str) -> Result<RedisPool, std::io::Error> {
-    let mut cfg = RedisConfig::default();
-    cfg.url = Some(redis_url.to_string());
+    let cfg = RedisConfig::from_url(redis_url);
+
     cfg.create_pool(Some(deadpool_redis::Runtime::Tokio1))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e))
+        .map_err(|e| {
+            eprintln!("Failed to create Redis pool ({}): {}", redis_url, e);
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e)
+        })
 }

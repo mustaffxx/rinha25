@@ -9,22 +9,24 @@ use tokio::sync::mpsc;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:password@localhost/rinha25".to_string());
+    let database_url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL environment variable must be set");
 
     let manager = rinha25::models::create_pg_manager(&database_url)?;
     let db = rinha25::models::create_db_pool(manager).await?;
-
-    let http_client = reqwest::Client::builder()
-        .build()
-        .expect("Failed to create HTTP client");
 
     let redis_url = std::env::var("REDIS_URL").expect("REDIS_URL must be set");
     let redis_pool = rinha25::models::create_redis_pool(&redis_url)?;
 
     let health_data = Arc::new(Mutex::new(HashMap::new()));
 
-    for worker_id in 0..2 {
+    let http_client = reqwest::Client::builder()
+        .build()
+        .expect("Failed to create HTTP client");
+
+    start_health_checker(health_data.clone(), http_client.clone());
+
+    for worker_id in 0..5 {
         tokio::spawn(payment_worker(
             worker_id,
             http_client.clone(),
@@ -41,7 +43,7 @@ async fn main() -> std::io::Result<()> {
         health_data.clone(),
     );
 
-    start_health_checker(health_data, http_client);
+    println!("API started and listening on 0.0.0.0:8080");
 
     HttpServer::new(move || {
         App::new()

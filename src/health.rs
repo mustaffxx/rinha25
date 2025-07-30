@@ -10,7 +10,7 @@ pub fn start_health_checker(
     let client_default = client.clone();
 
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(200));
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
         loop {
             interval.tick().await;
 
@@ -29,7 +29,7 @@ pub fn start_health_checker(
     let health_data_fallback = health_data.clone();
 
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(200));
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
         loop {
             interval.tick().await;
             if let Ok(fallback) = check_processor_health(
@@ -49,11 +49,7 @@ pub async fn check_processor_health(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<HealthResponse, Box<dyn std::error::Error + Send + Sync>> {
-    let response = client
-        .get(url)
-        .timeout(Duration::from_millis(200))
-        .send()
-        .await?;
+    let response = client.get(url).send().await?;
 
     Ok(response.json().await?)
 }
@@ -71,50 +67,22 @@ pub async fn get_process_payment(
     health_data: &Arc<Mutex<HashMap<String, HealthResponse>>>,
     _payment_data: &PaymentRequest,
 ) -> Option<&'static str> {
-    let default_healthy = get_processor_healthy(health_data, "default").await;
-    let fallback_healthy = get_processor_healthy(health_data, "fallback").await;
+    let default = get_processor_healthy(health_data, "default").await;
+    let fallback = get_processor_healthy(health_data, "fallback").await;
 
-    match (default_healthy, fallback_healthy) {
-        (Some(default), Some(fallback)) => match (default.failing, fallback.failing) {
-            (true, true) => {
-                eprintln!("Both processors are unhealthy");
-                None
-            }
-            (false, false) => {
-                if default.min_response_time <= fallback.min_response_time {
-                    Some("default")
-                } else {
-                    Some("fallback")
-                }
-            }
-            (true, false) => {
-                eprintln!("Default processor is unhealthy, using fallback");
-                Some("fallback")
-            }
-            (false, true) => {
-                eprintln!("Fallback processor is unhealthy, using default");
+    match (
+        default.as_ref().filter(|d| !d.failing),
+        fallback.as_ref().filter(|f| !f.failing),
+    ) {
+        (Some(d), Some(f)) => {
+            if d.min_response_time <= f.min_response_time {
                 Some("default")
-            }
-        },
-        (Some(default), None) => {
-            if default.failing {
-                eprintln!("Default processor is unhealthy and fallback is unavailable");
-                None
-            } else {
-                Some("default")
-            }
-        }
-        (None, Some(fallback)) => {
-            if fallback.failing {
-                eprintln!("Fallback processor is unhealthy and default is unavailable");
-                None
             } else {
                 Some("fallback")
             }
         }
-        (None, None) => {
-            eprintln!("No processor health data available");
-            None
-        }
+        (Some(_), None) => Some("default"),
+        (None, Some(_)) => Some("fallback"),
+        _ => None,
     }
 }

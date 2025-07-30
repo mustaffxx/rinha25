@@ -57,6 +57,7 @@ pub async fn get_payment_summary(
     let from_ts = query
         .from
         .map_or(f64::MIN, |dt| dt.timestamp_millis() as f64);
+
     let to_ts = query.to.map_or(f64::MAX, |dt| dt.timestamp_millis() as f64);
 
     let default_metrics = get_metrics(&mut conn, "default", from_ts, to_ts)
