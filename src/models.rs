@@ -1,5 +1,4 @@
 use chrono::{DateTime, Utc};
-use deadpool_redis::Config as RedisConfig;
 use deadpool_redis::Pool as RedisPool;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -68,14 +67,4 @@ impl AppState {
             payment_sender,
         }
     }
-}
-
-pub fn create_redis_pool(redis_url: &str) -> Result<RedisPool, std::io::Error> {
-    let cfg = RedisConfig::from_url(redis_url);
-
-    cfg.create_pool(Some(deadpool_redis::Runtime::Tokio1))
-        .map_err(|e| {
-            eprintln!("Failed to create Redis pool ({}): {}", redis_url, e);
-            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e)
-        })
 }

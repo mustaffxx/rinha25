@@ -1,5 +1,4 @@
 use crate::models::{AppState, PaymentMetrics, PaymentRequest, PaymentSummary, SummaryQuery};
-use crate::redis_helpers::{acquire_redis_lock, release_redis_lock};
 use actix_web::{HttpResponse, Result, web};
 use chrono::Utc;
 use deadpool_redis::redis::AsyncCommands;
@@ -31,15 +30,6 @@ pub async fn get_payment_summary(
     query: web::Query<SummaryQuery>,
     data: web::Data<AppState>,
 ) -> Result<HttpResponse> {
-    const LOCK_KEY: &str = "payments_summary_lock";
-    const LOCK_TTL: usize = 10;
-
-    if !acquire_redis_lock(&data.redis_pool, LOCK_KEY, LOCK_TTL).await {
-        return Err(actix_web::error::ErrorTooManyRequests(
-            "Summary in progress, try again later",
-        ));
-    }
-
     let redis_pool = &data.redis_pool;
     let mut conn = redis_pool.get().await.map_err(|e| {
         eprintln!("Failed to get Redis connection for summary: {}", e);
@@ -64,8 +54,6 @@ pub async fn get_payment_summary(
         default: default_metrics,
         fallback: fallback_metrics,
     };
-
-    release_redis_lock(&data.redis_pool, LOCK_KEY).await;
 
     Ok(HttpResponse::Ok().json(summary))
 }

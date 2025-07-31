@@ -1,3 +1,4 @@
+use deadpool_redis::Config as RedisConfig;
 use deadpool_redis::Pool as RedisPool;
 use deadpool_redis::redis::AsyncCommands;
 
@@ -32,4 +33,27 @@ pub async fn is_redis_locked(redis_pool: &RedisPool, key: &str) -> bool {
     } else {
         false
     }
+}
+
+pub fn create_redis_pool(redis_url: &str) -> Result<RedisPool, std::io::Error> {
+    let cfg = RedisConfig::from_url(redis_url);
+
+    cfg.create_pool(Some(deadpool_redis::Runtime::Tokio1))
+        .map_err(|e| {
+            eprintln!("Failed to create Redis pool ({}): {}", redis_url, e);
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e)
+        })
+}
+
+pub async fn clean_redis(redis_pool: &RedisPool) -> Result<(), std::io::Error> {
+    let mut conn: deadpool_redis::Connection = redis_pool.get().await.map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "Failed to get Redis connection",
+        )
+    })?;
+
+    conn.flushall()
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Failed to clean Redis"))
 }

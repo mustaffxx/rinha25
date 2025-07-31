@@ -9,7 +9,10 @@ use tokio::sync::mpsc;
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let redis_url = std::env::var("REDIS_URL").expect("REDIS_URL must be set");
-    let redis_pool = rinha25::models::create_redis_pool(&redis_url)?;
+    let redis_pool = rinha25::redis_helpers::create_redis_pool(&redis_url)?;
+    rinha25::redis_helpers::clean_redis(&redis_pool)
+        .await
+        .expect("Failed to clean Redis");
 
     let http_client = reqwest::Client::builder()
         .build()
