@@ -1,15 +1,8 @@
-use bb8::Pool;
-use bb8_postgres::PostgresConnectionManager;
 use chrono::{DateTime, Utc};
 use deadpool_redis::Config as RedisConfig;
 use deadpool_redis::Pool as RedisPool;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::Mutex;
 use tokio::sync::mpsc;
-use tokio_postgres::NoTls;
-
-pub type DbPool = Pool<PostgresConnectionManager<NoTls>>;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PaymentMetrics {
@@ -60,45 +53,21 @@ pub struct HealthResponse {
 pub struct AppState {
     pub http_client: reqwest::Client,
     pub redis_pool: RedisPool,
-    pub db: DbPool,
-    pub payment_queue: mpsc::UnboundedSender<PaymentRequest>,
-    pub health_data: Arc<Mutex<HashMap<String, HealthResponse>>>,
+    pub payment_sender: mpsc::Sender<PaymentRequest>,
 }
 
 impl AppState {
     pub fn new(
         http_client: reqwest::Client,
         redis_pool: RedisPool,
-        db: DbPool,
-        payment_queue: mpsc::UnboundedSender<PaymentRequest>,
-        health_data: Arc<Mutex<HashMap<String, HealthResponse>>>,
+        payment_sender: mpsc::Sender<PaymentRequest>,
     ) -> Self {
         Self {
             http_client,
             redis_pool,
-            db,
-            payment_queue,
-            health_data,
+            payment_sender,
         }
     }
-}
-
-pub fn create_pg_manager(
-    database_url: &str,
-) -> Result<PostgresConnectionManager<NoTls>, std::io::Error> {
-    PostgresConnectionManager::new_from_stringlike(database_url, NoTls).map_err(|e| {
-        eprintln!("Failed to create PostgresConnectionManager: {}", e);
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-    })
-}
-
-pub async fn create_db_pool(
-    manager: PostgresConnectionManager<NoTls>,
-) -> Result<DbPool, std::io::Error> {
-    Pool::builder().build(manager).await.map_err(|e| {
-        eprintln!("Failed to create Postgres DB pool: {}", e);
-        std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e)
-    })
 }
 
 pub fn create_redis_pool(redis_url: &str) -> Result<RedisPool, std::io::Error> {

@@ -11,25 +11,17 @@ pub async fn create_payment(
     data: web::Data<AppState>,
 ) -> Result<HttpResponse> {
     let state = data.get_ref();
-    let redis_pool = state.redis_pool.clone();
+    let sender = &state.payment_sender;
 
     let mut payment_data = payment.into_inner();
     payment_data.requested_at = Some(Utc::now());
-    let correlation_id = payment_data.correlation_id.clone();
 
-    tokio::spawn(async move {
-        if let Ok(mut conn) = redis_pool.get().await {
-            let cache_key = format!("payment_exists:{}", correlation_id);
-            if let Ok(Some(1)) = conn.get::<_, Option<u8>>(&cache_key).await {
-                return;
-            }
-
-            if let Ok(payload) = serde_json::to_vec(&payment_data) {
-                let _ = conn.rpush::<_, _, ()>("payments_queue", payload).await;
-                let _: Result<(), _> = conn.set_ex(&cache_key, 1u8, 600).await;
-            }
-        }
-    });
+    if let Err(e) = sender.send(payment_data).await {
+        eprintln!("Failed to send payment: {}", e);
+        return Err(actix_web::error::ErrorInternalServerError(
+            "Failed to process payment",
+        ));
+    }
 
     Ok(HttpResponse::Ok().json(json!({"status": "accepted"})))
 }
