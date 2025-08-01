@@ -20,7 +20,7 @@ services:
           memory: "50MB"
 
   api1: &api
-    build: .
+    image: felipeamorimw/rinha25:latest
     container_name: rinha-api1
     hostname: api1
     environment:
