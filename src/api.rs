@@ -1,8 +1,20 @@
 use crate::models::{AppState, PaymentMetrics, PaymentRequest, PaymentSummary, SummaryQuery};
+use crate::redis_helpers;
 use actix_web::{HttpResponse, Result, web};
 use chrono::Utc;
 use deadpool_redis::redis::AsyncCommands;
 use serde_json::json;
+
+#[actix_web::post("/purge-payments")]
+pub async fn purge_payments(data: web::Data<AppState>) -> Result<HttpResponse> {
+    let redis_pool = &data.redis_pool;
+    redis_helpers::clean_redis(redis_pool).await.map_err(|e| {
+        eprintln!("Failed to purge payments: {}", e);
+        actix_web::error::ErrorInternalServerError("Failed to purge payments")
+    })?;
+
+    Ok(HttpResponse::Ok().json(json!({"status": "purged"})))
+}
 
 #[actix_web::post("/payments")]
 pub async fn create_payment(

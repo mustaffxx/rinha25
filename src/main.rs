@@ -21,7 +21,7 @@ async fn main() -> std::io::Result<()> {
     let (payment_sender, payment_receiver) = mpsc::channel::<PaymentRequest>(100_000);
     let payment_receiver = Arc::new(Mutex::new(payment_receiver));
 
-    for worker_id in 0..10 {
+    for worker_id in 0..2 {
         tokio::spawn(payment_worker(
             worker_id,
             http_client.clone(),

@@ -3,21 +3,11 @@ use deadpool_redis::Pool as RedisPool;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct PaymentMetrics {
-    #[serde(rename = "totalRequests")]
     pub total_requests: u64,
-    #[serde(rename = "totalAmount")]
     pub total_amount: f64,
-}
-
-impl Default for PaymentMetrics {
-    fn default() -> Self {
-        PaymentMetrics {
-            total_requests: 0,
-            total_amount: 0.0,
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -33,18 +23,17 @@ pub struct SummaryQuery {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct PaymentRequest {
-    #[serde(rename = "correlationId")]
     pub correlation_id: String,
     pub amount: f64,
-    #[serde(rename = "requestedAt")]
     pub requested_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct HealthResponse {
     pub failing: bool,
-    #[serde(rename = "minResponseTime")]
     pub min_response_time: u64,
 }
 
